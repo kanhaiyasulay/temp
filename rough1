@@ -1,92 +1,242 @@
-I am building a real-time voice-based sales training simulator using Azure VoiceLive.
+# -------------------------------------------------------------------------
+# FastAPI backend for Voice Mode Agent — Avatar Edition
+# -------------------------------------------------------------------------
+# PyAudio is removed. All real-time audio/video happens in the browser
+# via Azure Speech SDK + WebRTC.  This backend provides:
+#   GET  /api/speech-token  — short-lived token + ICE creds for the avatar
+#   POST /api/chat          — relay user text to Azure OpenAI, return reply
+#   POST /api/evaluate      — evaluate a conversation transcript
+# -------------------------------------------------------------------------
 
-Current Setup:
+import json
+import os
 
-* Backend is written in Python using Azure VoiceLive SDK
-* It uses PyAudio for microphone input and speaker output
-* The AI behaves like a "customer" and interacts with a salesperson
-* It captures conversation history and generates evaluation at the end
-* The system is event-driven and streams audio using WebSockets
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-Now I want to UPGRADE this system to include an AI Avatar (talking face) in a React frontend.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
-IMPORTANT:
-The current Python backend handles audio input/output using PyAudio, but this WILL NOT WORK for a browser-based avatar system. The browser must handle mic, audio playback, and video rendering.
+app = FastAPI(title="Voice Mode Agent API")
 
-Your Task:
-Refactor the architecture and implement a working solution where:
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-1. React frontend:
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+CONVERSATION_FILE = os.path.join(BACKEND_DIR, "logs", "last_conversation.json")
 
-   * Captures microphone input from the browser
-   * Streams audio to Azure VoiceLive (or via backend if needed)
-   * Receives audio/video stream from Azure Avatar service
-   * Displays a real-time talking avatar using a <video> element
-   * Handles interruptions (barge-in)
-   * Shows conversation transcript in UI
 
-2. Azure Avatar Integration:
+# ── Request models ──────────────────────────────────────────────────────
 
-   * Use Azure AI Avatar / VoiceLive compatible approach
-   * Avatar should lip-sync with generated speech
-   * Use WebRTC or streaming API (NOT PyAudio)
-   * Maintain low latency
+class ChatRequest(BaseModel):
+    user_message: str
+    conversation_history: list[dict] = []
+    system_prompt: str = ""
 
-3. Backend (Python - optional role):
 
-   * Remove PyAudio completely
-   * Keep only:
+class EvaluateRequest(BaseModel):
+    transcript: list[dict]
 
-     * conversation history tracking
-     * evaluation generation logic
-   * Expose API endpoint:
-     POST /evaluate
-     which takes conversation transcript and returns evaluation
 
-4. AI Behavior:
+# ── GET /api/speech-token ───────────────────────────────────────────────
 
-   * Preserve current system prompt:
-     "You are a skeptical customer..."
-   * Ensure conversation feels realistic:
+@app.get("/api/speech-token")
+async def get_speech_token():
+    """Exchange the Speech API key for a short-lived auth token and
+    ICE relay credentials needed by the browser for WebRTC avatar."""
+    speech_key = os.getenv("AZURE_SPEECH_KEY", "")
+    speech_region = os.getenv("AZURE_SPEECH_REGION", "")
 
-     * ask questions
-     * raise objections
-     * discuss pricing, ROI, competitors
+    if not speech_key or not speech_region:
+        raise HTTPException(
+            status_code=500,
+            detail="AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set in .env",
+        )
 
-5. Event Handling:
+    # 1) Speech authorization token (valid ~10 min)
+    token_url = (
+        f"https://{speech_region}.api.cognitive.microsoft.com"
+        "/sts/v1.0/issueToken"
+    )
+    try:
+        r = requests.post(
+            token_url,
+            headers={"Ocp-Apim-Subscription-Key": speech_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        speech_token = r.text
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Token request failed: {exc}")
 
-   * Handle:
+    # 2) ICE relay credentials for avatar WebRTC
+    ice_url = (
+        f"https://{speech_region}.tts.speech.microsoft.com"
+        "/cognitiveservices/avatar/relay/token/v1"
+    )
+    try:
+        r = requests.get(
+            ice_url,
+            headers={"Ocp-Apim-Subscription-Key": speech_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        ice_data = r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ICE token request failed: {exc}")
 
-     * speech start
-     * speech stop
-     * AI response streaming
-   * Support interruption (user speaking over AI)
+    return {
+        "token": speech_token,
+        "region": speech_region,
+        "iceServers": ice_data,
+        "avatarCharacter": os.getenv("AZURE_AVATAR_CHARACTER", "lisa"),
+        "avatarStyle": os.getenv("AZURE_AVATAR_STYLE", "casual-sitting"),
+        "voiceName": os.getenv(
+            "AZURE_SPEECH_VOICE", "en-US-AvaMultilingualNeural"
+        ),
+    }
 
-6. Code Requirements:
 
-   * Provide FULL working React code (not pseudo code)
-   * Use modern React (hooks)
-   * Include setup instructions
-   * Show how to connect to Azure VoiceLive / Avatar
-   * Show how to stream audio from mic
-   * Show how to render avatar video stream
+# ── POST /api/chat ─────────────────────────────────────────────────────
 
-7. Constraints:
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """Send user text to Azure OpenAI and return the AI customer reply."""
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_KEY", "")
+    model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
 
-   * Do NOT use PyAudio
-   * Do NOT rely on local audio playback in Python
-   * Everything real-time must happen in browser
-   * Keep latency as low as possible
+    if not endpoint or not api_key:
+        raise HTTPException(
+            status_code=500, detail="Azure OpenAI credentials not configured"
+        )
 
-8. Bonus (if possible):
+    system_prompt = (
+        "You are pretending to be a potential customer evaluating a product.\n\n"
+        "Your personality:\n"
+        "- Curious\n"
+        "- Slightly skeptical\n"
+        "- Ask realistic questions\n"
+        "- Raise objections about price, ROI, competitors\n\n"
+        "Speak naturally like a human customer. "
+        "Keep responses conversational and concise (2-4 sentences)."
+    )
+    if req.system_prompt:
+        system_prompt += f"\n\nAdditional context:\n{req.system_prompt}"
 
-   * Show how to store conversation in frontend and send to backend for evaluation
-   * Add a button "End Session" → triggers evaluation
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in req.conversation_history:
+        messages.append(
+            {
+                "role": "assistant" if msg.get("role") == "assistant" else "user",
+                "content": msg["text"],
+            }
+        )
+    messages.append({"role": "user", "content": req.user_message})
 
-Also provide setup steps at last
+    url = (
+        f"{endpoint}/openai/deployments/{model}"
+        "/chat/completions?api-version=2024-12-01-preview"
+    )
+    headers = {"api-key": api_key, "Content-Type": "application/json"}
+    body = {"messages": messages, "temperature": 0.8, "max_tokens": 300}
 
-Goal:
-End result should be a working system where:
-User speaks → AI responds → Avatar speaks with lip-sync → conversation is tracked → evaluation is generated.
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        return {"response": r.json()["choices"][0]["message"]["content"]}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}")
 
-Do NOT give high-level explanation only. I want IMPLEMENTATION.
+
+# ── POST /api/evaluate ─────────────────────────────────────────────────
+
+@app.post("/api/evaluate")
+async def evaluate(req: EvaluateRequest):
+    """Evaluate a sales conversation transcript and return structured feedback."""
+    _save_conversation(req.transcript)
+    return _generate_evaluation(req.transcript)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+def _save_conversation(transcript: list[dict]):
+    os.makedirs(os.path.join(BACKEND_DIR, "logs"), exist_ok=True)
+    with open(CONVERSATION_FILE, "w", encoding="utf-8") as f:
+        json.dump(transcript, f, ensure_ascii=False, indent=2)
+
+
+def _generate_evaluation(conversation: list[dict]) -> dict:
+    """Call Azure OpenAI to evaluate the sales conversation."""
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_KEY", "")
+    model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+
+    if not conversation:
+        return {
+            "strength": ["No conversation recorded."],
+            "weakness": [],
+            "rating": 0,
+            "summary": "The session ended before any conversation took place.",
+        }
+
+    transcript_text = "\n".join(
+        f"{m['role']}: {m['text']}" for m in conversation
+    )
+
+    url = (
+        f"{endpoint}/openai/deployments/{model}"
+        "/chat/completions?api-version=2024-12-01-preview"
+    )
+    headers = {"api-key": api_key, "Content-Type": "application/json"}
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert sales trainer. Evaluate the salesperson "
+                    "based on the conversation transcript below.\n\n"
+                    "Respond ONLY in valid JSON format:\n"
+                    "{\n"
+                    '  "strength": ["point1", "point2", "point3"],\n'
+                    '  "weakness": ["point1", "point2", "point3"],\n'
+                    '  "rating": 7.5,\n'
+                    '  "summary": "short paragraph"\n'
+                    "}\n\n"
+                    "IMPORTANT:\n"
+                    "- strength and weakness MUST be arrays (bullet points)\n"
+                    "- Do not return paragraphs inside them\n"
+                    "- rating must be between 0 to 10"
+                ),
+            },
+            {"role": "user", "content": transcript_text},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 500,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        ev = json.loads(raw)
+        return {
+            "strength": ev.get("strength", []),
+            "weakness": ev.get("weakness", []),
+            "rating": float(ev.get("rating", 0)),
+            "summary": ev.get("summary", ""),
+        }
+    except Exception as exc:
+        return {
+            "strength": [],
+            "weakness": [],
+            "rating": 0,
+            "summary": f"Could not generate evaluation: {exc}",
+        }
