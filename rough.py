@@ -1,554 +1,323 @@
+# main.py
 # -------------------------------------------------------------------------
-# Copyright (c) Microsoft Corporation. All rights reserved.
-# Licensed under the MIT License.
+# FastAPI backend for Voice Mode Agent — Avatar Edition
 # -------------------------------------------------------------------------
-from __future__ import annotations
+# PyAudio is removed. All real-time audio/video happens in the browser
+# via Azure Speech SDK + WebRTC.  This backend provides:
+#   GET  /api/speech-token  — short-lived token + ICE creds for the avatar
+#   POST /api/chat          — relay user text to Azure OpenAI, return reply
+#   POST /api/evaluate      — evaluate a conversation transcript
+# -------------------------------------------------------------------------
+
+import json
 import os
-import sys
-import argparse
-import asyncio
-import base64
-from datetime import datetime
-import logging
-import queue
-import signal
-from typing import Union, Optional, TYPE_CHECKING, cast
 
-from azure.core.credentials import AzureKeyCredential
-from azure.core.credentials_async import AsyncTokenCredential
-from azure.identity.aio import AzureCliCredential, DefaultAzureCredential
+import truststore
+truststore.inject_into_ssl()
 
-from azure.ai.voicelive.aio import connect
-from azure.ai.voicelive.models import (
-    AudioEchoCancellation,
-    AudioNoiseReduction,
-    AzureStandardVoice,
-    InputAudioFormat,
-    Modality,
-    OutputAudioFormat,
-    RequestSession,
-    ServerEventType,
-    ServerVad
-)
+import httpx
+import requests
 from dotenv import load_dotenv
-import pyaudio
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-if TYPE_CHECKING:
-    # Only needed for type checking; avoids runtime import issues
-    from azure.ai.voicelive.aio import VoiceLiveConnection
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
-## Change to the directory where this script is located
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+app = FastAPI(title="Voice Mode Agent API")
 
-# Environment variable loading
-load_dotenv('./.env', override=True)
-
-# Set up logging
-## Add folder for logging
-if not os.path.exists('logs'):
-    os.makedirs('logs')
-
-## Add timestamp for logfiles
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-## Set up logging
-logging.basicConfig(
-    filename=f'logs/{timestamp}_voicelive.log',
-    filemode="w",
-    format='%(asctime)s:%(name)s:%(levelname)s:%(message)s',
-    level=logging.INFO
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-logger = logging.getLogger(__name__)
 
-class AudioProcessor:
-    """
-    Handles real-time audio capture and playback for the voice assistant.
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+CONVERSATION_FILE = os.path.join(BACKEND_DIR, "logs", "last_conversation.json")
 
-    Threading Architecture:
-    - Main thread: Event loop and UI
-    - Capture thread: PyAudio input stream reading
-    - Send thread: Async audio data transmission to VoiceLive
-    - Playback thread: PyAudio output stream writing
-    """
-    
-    loop: asyncio.AbstractEventLoop
-    
-    class AudioPlaybackPacket:
-        """Represents a packet that can be sent to the audio playback queue."""
-        def __init__(self, seq_num: int, data: Optional[bytes]):
-            self.seq_num = seq_num
-            self.data = data
 
-    def __init__(self, connection):
-        self.connection = connection
-        self.audio = pyaudio.PyAudio()
+# ── Request models ──────────────────────────────────────────────────────
 
-        # Audio configuration - PCM16, 24kHz, mono as specified
-        self.format = pyaudio.paInt16
-        self.channels = 1
-        self.rate = 24000
-        self.chunk_size = 1200 # 50ms
+class ChatRequest(BaseModel):
+    user_message: str
+    conversation_history: list[dict] = []
+    system_prompt: str = ""
 
-        # Capture and playback state
-        self.input_stream = None
 
-        self.playback_queue: queue.Queue[AudioProcessor.AudioPlaybackPacket] = queue.Queue()
-        self.playback_base = 0
-        self.next_seq_num = 0
-        self.output_stream: Optional[pyaudio.Stream] = None
+class EvaluateRequest(BaseModel):
+    transcript: list[dict]
 
-        logger.info("AudioProcessor initialized with 24kHz PCM16 mono audio")
 
-    def start_capture(self):
-        """Start capturing audio from microphone."""
-        def _capture_callback(
-            in_data,      # data
-            _frame_count,  # number of frames
-            _time_info,    # dictionary
-            _status_flags):
-            """Audio capture thread - runs in background."""
-            audio_base64 = base64.b64encode(in_data).decode("utf-8")
-            asyncio.run_coroutine_threadsafe(
-                self.connection.input_audio_buffer.append(audio=audio_base64), self.loop
-            )
-            return (None, pyaudio.paContinue)
+# ── GET /api/speech-token ───────────────────────────────────────────────
 
-        if self.input_stream:
-            return
+@app.get("/api/speech-token")
+async def get_speech_token():
+    """Exchange the Speech API key for a short-lived auth token and
+    ICE relay credentials needed by the browser for WebRTC avatar."""
+    speech_key = os.getenv("AZURE_SPEECH_KEY", "")
+    speech_region = os.getenv("AZURE_SPEECH_REGION", "")
 
-        # Store the current event loop for use in threads
-        self.loop = asyncio.get_event_loop()
-
-        try:
-            self.input_stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.chunk_size,
-                stream_callback=_capture_callback,
-            )
-            logger.info("Started audio capture")
-
-        except Exception:
-            logger.exception("Failed to start audio capture")
-            raise
-
-    def start_playback(self):
-        """Initialize audio playback system."""
-        if self.output_stream:
-            return
-
-        remaining = bytes()
-        def _playback_callback(
-            _in_data,
-            frame_count,  # number of frames
-            _time_info,
-            _status_flags):
-
-            nonlocal remaining
-            frame_count *= pyaudio.get_sample_size(pyaudio.paInt16)
-
-            out = remaining[:frame_count]
-            remaining = remaining[frame_count:]
-
-            while len(out) < frame_count:
-                try:
-                    packet = self.playback_queue.get_nowait()
-                except queue.Empty:
-                    out = out + bytes(frame_count - len(out))
-                    continue
-                except Exception:
-                    logger.exception("Error in audio playback")
-                    raise
-
-                if not packet or not packet.data:
-                    # None packet indicates end of stream
-                    logger.info("End of playback queue.")
-                    break
-
-                if packet.seq_num < self.playback_base:
-                    # skip requested
-                    # ignore skipped packet and clear remaining
-                    if len(remaining) > 0:
-                        remaining = bytes()
-                    continue
-
-                num_to_take = frame_count - len(out)
-                out = out + packet.data[:num_to_take]
-                remaining = packet.data[num_to_take:]
-
-            if len(out) >= frame_count:
-                return (out, pyaudio.paContinue)
-            else:
-                return (out, pyaudio.paComplete)
-
-        try:
-            self.output_stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                output=True,
-                frames_per_buffer=self.chunk_size,
-                stream_callback=_playback_callback
-            )
-            logger.info("Audio playback system ready")
-        except Exception:
-            logger.exception("Failed to initialize audio playback")
-            raise
-
-    def _get_and_increase_seq_num(self):
-        seq = self.next_seq_num
-        self.next_seq_num += 1
-        return seq
-
-    def queue_audio(self, audio_data: Optional[bytes]) -> None:
-        """Queue audio data for playback."""
-        self.playback_queue.put(
-            AudioProcessor.AudioPlaybackPacket(
-                seq_num=self._get_and_increase_seq_num(),
-                data=audio_data))
-
-    def skip_pending_audio(self):
-        """Skip current audio in playback queue."""
-        self.playback_base = self._get_and_increase_seq_num()
-
-    def shutdown(self):
-        """Clean up audio resources."""
-        if self.input_stream:
-            self.input_stream.stop_stream()
-            self.input_stream.close()
-            self.input_stream = None
-
-        logger.info("Stopped audio capture")
-
-        # Inform thread to complete
-        if self.output_stream:
-            self.skip_pending_audio()
-            self.queue_audio(None)
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-            self.output_stream = None
-
-        logger.info("Stopped audio playback")
-
-        if self.audio:
-            self.audio.terminate()
-
-        logger.info("Audio processor cleaned up")
-
-class BasicVoiceAssistant:
-    """Basic voice assistant implementing the VoiceLive SDK patterns."""
-
-    def __init__(
-        self,
-        endpoint: str,
-        credential: Union[AzureKeyCredential, AsyncTokenCredential],
-        model: str,
-        voice: str,
-        instructions: str,
-    ):
-
-        self.endpoint = endpoint
-        self.credential = credential
-        self.model = model
-        self.voice = voice
-        self.instructions = instructions
-        self.connection: Optional["VoiceLiveConnection"] = None
-        self.audio_processor: Optional[AudioProcessor] = None
-        self.session_ready = False
-        self._active_response = False
-        self._response_api_done = False
-
-    async def start(self):
-        """Start the voice assistant session."""
-        try:
-            logger.info("Connecting to VoiceLive API with model %s", self.model)
-
-            # Connect to VoiceLive WebSocket API
-            async with connect(
-                endpoint=self.endpoint,
-                credential=self.credential,
-                model=self.model,
-            ) as connection:
-                conn = connection
-                self.connection = conn
-
-                # Initialize audio processor
-                ap = AudioProcessor(conn)
-                self.audio_processor = ap
-
-                # Configure session for voice conversation
-                await self._setup_session()
-
-                # Start audio systems
-                ap.start_playback()
-
-                logger.info("Voice assistant ready! Start speaking...")
-                print("\n" + "=" * 60)
-                print("🎤 VOICE ASSISTANT READY")
-                print("Start speaking to begin conversation")
-                print("Press Ctrl+C to exit")
-                print("=" * 60 + "\n")
-
-                # Process events
-                await self._process_events()
-        finally:
-            if self.audio_processor:
-                self.audio_processor.shutdown()
-
-    async def _setup_session(self):
-        """Configure the VoiceLive session for audio conversation."""
-        logger.info("Setting up voice conversation session...")
-
-        # Create voice configuration
-        voice_config: Union[AzureStandardVoice, str]
-        if self.voice.startswith("en-US-") or self.voice.startswith("en-CA-") or "-" in self.voice:
-            # Azure voice
-            voice_config = AzureStandardVoice(name=self.voice)
-        else:
-            # OpenAI voice (alloy, echo, fable, onyx, nova, shimmer)
-            voice_config = self.voice
-
-        # Create turn detection configuration
-        turn_detection_config = ServerVad(
-            threshold=0.5,
-            prefix_padding_ms=300,
-            silence_duration_ms=500)
-
-        # Create session configuration
-        session_config = RequestSession(
-            modalities=[Modality.TEXT, Modality.AUDIO],
-            instructions=self.instructions,
-            voice=voice_config,
-            input_audio_format=InputAudioFormat.PCM16,
-            output_audio_format=OutputAudioFormat.PCM16,
-            turn_detection=turn_detection_config,
-            input_audio_echo_cancellation=AudioEchoCancellation(),
-            input_audio_noise_reduction=AudioNoiseReduction(type="azure_deep_noise_suppression"),
+    if not speech_key or not speech_region:
+        raise HTTPException(
+            status_code=500,
+            detail="AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set in .env",
         )
 
-        conn = self.connection
-        assert conn is not None, "Connection must be established before setting up session"
-        await conn.session.update(session=session_config)
-
-        logger.info("Session configuration sent")
-
-    async def _process_events(self):
-        """Process events from the VoiceLive connection."""
-        try:
-            conn = self.connection
-            assert conn is not None, "Connection must be established before processing events"
-            async for event in conn:
-                await self._handle_event(event)
-        except Exception:
-            logger.exception("Error processing events")
-            raise
-
-    async def _handle_event(self, event):
-        """Handle different types of events from VoiceLive."""
-        logger.debug("Received event: %s", event.type)
-        ap = self.audio_processor
-        conn = self.connection
-        assert ap is not None, "AudioProcessor must be initialized"
-        assert conn is not None, "Connection must be established"
-
-        if event.type == ServerEventType.SESSION_UPDATED:
-            logger.info("Session ready: %s", event.session.id)
-            self.session_ready = True
-
-            # Start audio capture once session is ready
-            ap.start_capture()
-
-        elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
-            logger.info("User started speaking - stopping playback")
-            print("🎤 Listening...")
-
-            ap.skip_pending_audio()
-
-            # Only cancel if response is active and not already done
-            if self._active_response and not self._response_api_done:
-                try:
-                    await conn.response.cancel()
-                    logger.debug("Cancelled in-progress response due to barge-in")
-                except Exception as e:
-                    if "no active response" in str(e).lower():
-                        logger.debug("Cancel ignored - response already completed")
-                    else:
-                        logger.warning("Cancel failed: %s", e)
-
-        elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-            logger.info("🎤 User stopped speaking")
-            print("🤔 Processing...")
-
-        elif event.type == ServerEventType.RESPONSE_CREATED:
-            logger.info("🤖 Assistant response created")
-            self._active_response = True
-            self._response_api_done = False
-
-        elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-            logger.debug("Received audio delta")
-            ap.queue_audio(event.delta)
-
-        elif event.type == ServerEventType.RESPONSE_AUDIO_DONE:
-            logger.info("🤖 Assistant finished speaking")
-            print("🎤 Ready for next input...")
-
-        elif event.type == ServerEventType.RESPONSE_DONE:
-            logger.info("✅ Response complete")
-            self._active_response = False
-            self._response_api_done = True
-
-        elif event.type == ServerEventType.ERROR:
-            msg = event.error.message
-            if "Cancellation failed: no active response" in msg:
-                logger.debug("Benign cancellation error: %s", msg)
-            else:
-                logger.error("❌ VoiceLive error: %s", msg)
-                print(f"Error: {msg}")
-
-        elif event.type == ServerEventType.CONVERSATION_ITEM_CREATED:
-            logger.debug("Conversation item created: %s", event.item.id)
-
-        else:
-            logger.debug("Unhandled event type: %s", event.type)
-
-
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Basic Voice Assistant using Azure VoiceLive SDK",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    # 1) Speech authorization token (valid ~10 min)
+    token_url = (
+        f"https://{speech_region}.api.cognitive.microsoft.com"
+        "/sts/v1.0/issueToken"
     )
+    try:
+        r = requests.post(
+            token_url,
+            headers={"Ocp-Apim-Subscription-Key": speech_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        speech_token = r.text
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Token request failed: {exc}")
 
-    parser.add_argument(
-        "--api-key",
-        help="Azure VoiceLive API key. If not provided, will use AZURE_VOICELIVE_API_KEY environment variable.",
-        type=str,
-        default=os.environ.get("AZURE_VOICELIVE_API_KEY"),
+    # 2) ICE relay credentials for avatar WebRTC
+    ice_url = (
+        f"https://{speech_region}.tts.speech.microsoft.com"
+        "/cognitiveservices/avatar/relay/token/v1"
     )
+    try:
+        r = requests.get(
+            ice_url,
+            headers={"Ocp-Apim-Subscription-Key": speech_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        ice_data = r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ICE token request failed: {exc}")
 
-    parser.add_argument(
-        "--endpoint",
-        help="Azure VoiceLive endpoint",
-        type=str,
-        default=os.environ.get("AZURE_VOICELIVE_ENDPOINT", "https://your-resource-name.services.ai.azure.com/"),
-    )
-
-    parser.add_argument(
-        "--model",
-        help="VoiceLive model to use",
-        type=str,
-        default=os.environ.get("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
-    )
-
-    parser.add_argument(
-        "--voice",
-        help="Voice to use for the assistant. E.g. alloy, echo, fable, en-US-AvaNeural, en-US-GuyNeural",
-        type=str,
-        default=os.environ.get("AZURE_VOICELIVE_VOICE", "en-US-Ava:DragonHDLatestNeural"),
-    )
-
-    parser.add_argument(
-        "--instructions",
-        help="System instructions for the AI assistant",
-        type=str,
-        default=os.environ.get(
-            "AZURE_VOICELIVE_INSTRUCTIONS",
-            "You are a helpful AI assistant. Respond naturally and conversationally. "
-            "Keep your responses concise but engaging.",
+    return {
+        "token": speech_token,
+        "region": speech_region,
+        "iceServers": ice_data,
+        "avatarCharacter": os.getenv("AZURE_AVATAR_CHARACTER", "lisa"),
+        "avatarStyle": os.getenv("AZURE_AVATAR_STYLE", "casual-sitting"),
+        "voiceName": os.getenv(
+            "AZURE_SPEECH_VOICE", "en-US-AvaMultilingualNeural"
         ),
+    }
+
+
+# ── POST /api/chat ─────────────────────────────────────────────────────
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """Send user text to Azure OpenAI and return the AI customer reply."""
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_KEY", "")
+    model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+
+    if not endpoint or not api_key:
+        raise HTTPException(
+            status_code=500, detail="Azure OpenAI credentials not configured"
+        )
+
+    system_prompt = (
+        "You are pretending to be a potential customer evaluating a product.\n\n"
+        "Your personality:\n"
+        "- Curious\n"
+        "- Slightly skeptical\n"
+        "- Ask realistic questions\n"
+        "- Raise objections about price, ROI, competitors\n\n"
+        "Speak naturally like a human customer. "
+        "Keep responses conversational and concise (2-4 sentences)."
     )
+    if req.system_prompt:
+        system_prompt += f"\n\nAdditional context:\n{req.system_prompt}"
 
-    parser.add_argument(
-        "--use-token-credential", help="Use Azure token credential instead of API key", action="store_true", default=False
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in req.conversation_history:
+        messages.append(
+            {
+                "role": "assistant" if msg.get("role") == "assistant" else "user",
+                "content": msg["text"],
+            }
+        )
+    messages.append({"role": "user", "content": req.user_message})
+
+    url = (
+        f"{endpoint}/openai/deployments/{model}"
+        "/chat/completions?api-version=2024-12-01-preview"
     )
+    headers = {"api-key": api_key, "Content-Type": "application/json"}
+    body = {"messages": messages, "temperature": 0.8, "max_tokens": 150}
 
-    parser.add_argument("--verbose", help="Enable verbose logging", action="store_true")
-
-    return parser.parse_args()
-
-
-def main():
-    """Main function."""
-    args = parse_arguments()
-
-    # Set logging level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    # Validate credentials
-    if not args.api_key and not args.use_token_credential:
-        print("❌ Error: No authentication provided")
-        print("Please provide an API key using --api-key or set AZURE_VOICELIVE_API_KEY environment variable,")
-        print("or use --use-token-credential for Azure authentication.")
-        sys.exit(1)
-
-    # Create client with appropriate credential
-    credential: Union[AzureKeyCredential, AsyncTokenCredential]
-    if args.use_token_credential:
-        credential = AzureCliCredential()  # or DefaultAzureCredential() if needed
-        logger.info("Using Azure token credential")
-    else:
-        credential = AzureKeyCredential(args.api_key)
-        logger.info("Using API key credential")
-
-    # Create and start voice assistant
-    assistant = BasicVoiceAssistant(
-        endpoint=args.endpoint,
-        credential=credential,
-        model=args.model,
-        voice=args.voice,
-        instructions=args.instructions,
-    )
-
-    # Setup signal handlers for graceful shutdown
-    def signal_handler(_sig, _frame):
-        logger.info("Received shutdown signal")
-        raise KeyboardInterrupt()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Start the assistant
     try:
-        asyncio.run(assistant.start())
-    except KeyboardInterrupt:
-        print("\n👋 Voice assistant shut down. Goodbye!")
-    except Exception as e:
-        print("Fatal Error: ", e)
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        return {"response": r.json()["choices"][0]["message"]["content"]}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}")
 
-if __name__ == "__main__":
-    # Check audio system
+
+# ── GET /api/chat-stream (SSE) ─────────────────────────────────────────
+
+@app.post("/api/chat-stream")
+async def chat_stream(req: ChatRequest):
+    """Stream Azure OpenAI tokens as SSE so the frontend can start avatar
+    speech on the first sentence without waiting for the full response."""
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_KEY", "")
+    model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+
+    if not endpoint or not api_key:
+        raise HTTPException(
+            status_code=500, detail="Azure OpenAI credentials not configured"
+        )
+
+    system_prompt = (
+        "You are pretending to be a potential customer evaluating a product.\n\n"
+        "Your personality:\n"
+        "- Curious\n"
+        "- Slightly skeptical\n"
+        "- Ask realistic questions\n"
+        "- Raise objections about price, ROI, competitors\n\n"
+        "Speak naturally like a human customer. "
+        "Keep responses conversational and concise (1-2 sentences)."
+    )
+    if req.system_prompt:
+        system_prompt += f"\n\nAdditional context:\n{req.system_prompt}"
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in req.conversation_history:
+        messages.append(
+            {
+                "role": "assistant" if msg.get("role") == "assistant" else "user",
+                "content": msg["text"],
+            }
+        )
+    messages.append({"role": "user", "content": req.user_message})
+
+    url = (
+        f"{endpoint}/openai/deployments/{model}"
+        "/chat/completions?api-version=2024-12-01-preview"
+    )
+    headers_oai = {"api-key": api_key, "Content-Type": "application/json"}
+    body = {
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 150,
+        "stream": True,
+    }
+
+    async def _generate():
+        async with httpx.AsyncClient(timeout=30) as client:
+            async with client.stream(
+                "POST", url, headers=headers_oai, json=body
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:]
+                    if payload.strip() == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        return
+                    try:
+                        chunk = json.loads(payload)
+                        delta = chunk["choices"][0].get("delta", {})
+                        token = delta.get("content")
+                        if token:
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+# ── POST /api/evaluate ─────────────────────────────────────────────────
+
+@app.post("/api/evaluate")
+async def evaluate(req: EvaluateRequest):
+    """Evaluate a sales conversation transcript and return structured feedback."""
+    _save_conversation(req.transcript)
+    return _generate_evaluation(req.transcript)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+def _save_conversation(transcript: list[dict]):
+    os.makedirs(os.path.join(BACKEND_DIR, "logs"), exist_ok=True)
+    with open(CONVERSATION_FILE, "w", encoding="utf-8") as f:
+        json.dump(transcript, f, ensure_ascii=False, indent=2)
+
+
+def _generate_evaluation(conversation: list[dict]) -> dict:
+    """Call Azure OpenAI to evaluate the sales conversation."""
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_KEY", "")
+    model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+
+    if not conversation:
+        return {
+            "strength": ["No conversation recorded."],
+            "weakness": [],
+            "rating": 0,
+            "summary": "The session ended before any conversation took place.",
+        }
+
+    transcript_text = "\n".join(
+        f"{m['role']}: {m['text']}" for m in conversation
+    )
+
+    url = (
+        f"{endpoint}/openai/deployments/{model}"
+        "/chat/completions?api-version=2024-12-01-preview"
+    )
+    headers = {"api-key": api_key, "Content-Type": "application/json"}
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert sales trainer. Evaluate the salesperson "
+                    "based on the conversation transcript below.\n\n"
+                    "Respond ONLY in valid JSON format:\n"
+                    "{\n"
+                    '  "strength": ["point1", "point2", "point3"],\n'
+                    '  "weakness": ["point1", "point2", "point3"],\n'
+                    '  "rating": 7.5,\n'
+                    '  "summary": "short paragraph"\n'
+                    "}\n\n"
+                    "IMPORTANT:\n"
+                    "- strength and weakness MUST be arrays (bullet points)\n"
+                    "- Do not return paragraphs inside them\n"
+                    "- rating must be between 0 to 10"
+                ),
+            },
+            {"role": "user", "content": transcript_text},
+        ],
+        "temperature": 0.6,
+        "max_tokens": 500,
+    }
+
     try:
-        p = pyaudio.PyAudio()
-        # Check for input devices
-        input_devices = [
-            i
-            for i in range(p.get_device_count())
-            if cast(Union[int, float], p.get_device_info_by_index(i).get("maxInputChannels", 0) or 0) > 0
-        ]
-        # Check for output devices
-        output_devices = [
-            i
-            for i in range(p.get_device_count())
-            if cast(Union[int, float], p.get_device_info_by_index(i).get("maxOutputChannels", 0) or 0) > 0
-        ]
-        p.terminate()
-
-        if not input_devices:
-            print("❌ No audio input devices found. Please check your microphone.")
-            sys.exit(1)
-        if not output_devices:
-            print("❌ No audio output devices found. Please check your speakers.")
-            sys.exit(1)
-
-    except Exception as e:
-        print(f"❌ Audio system check failed: {e}")
-        sys.exit(1)
-
-    print("🎙️  Basic Voice Assistant with Azure VoiceLive SDK")
-    print("=" * 50)
-
-    # Run the assistant
-    main()
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        ev = json.loads(raw)
+        return {
+            "strength": ev.get("strength", []),
+            "weakness": ev.get("weakness", []),
+            "rating": float(ev.get("rating", 0)),
+            "summary": ev.get("summary", ""),
+        }
+    except Exception as exc:
+        return {
+            "strength": [],
+            "weakness": [],
+            "rating": 0,
+            "summary": f"Could not generate evaluation: {exc}",
+        }
