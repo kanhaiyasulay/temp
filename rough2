@@ -1,6 +1,541 @@
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_KEY=your-key
-AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
+// TalkCustomer.jsx
 
-AZURE_SPEECH_KEY=your-speech-key
-AZURE_SPEECH_REGION=eastus2
+import { useNavigate } from "react-router-dom";
+import { useState, useRef, useEffect, useCallback } from "react";
+import {
+  FiArrowLeft,
+  FiGlobe,
+  FiEdit3,
+  FiPhoneOff,
+  FiMic,
+  FiMicOff,
+} from "react-icons/fi";
+import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
+
+const API_BASE = "http://localhost:8000";
+
+const LANGUAGE_MAP = {
+  English: "en-US",
+  Hindi: "hi-IN",
+  Polish: "pl-PL",
+  French: "fr-FR",
+  Norwegian: "nb-NO",
+};
+
+export default function TalkCustomer() {
+  const navigate = useNavigate();
+
+  const [language, setLanguage] = useState("English");
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [status, setStatus] = useState("idle"); // idle | connecting | connected | error
+  const [transcript, setTranscript] = useState([]);
+  const [interimText, setInterimText] = useState("");
+  const [isMuted, setIsMuted] = useState(false);
+  const [aiSpeaking, setAiSpeaking] = useState(false);
+
+  const videoRef = useRef(null);
+  const avatarSynthRef = useRef(null);
+  const recognizerRef = useRef(null);
+  const pcRef = useRef(null);
+  const historyRef = useRef([]);
+  const speakingRef = useRef(false);
+  const processingRef = useRef(false);
+  const transcriptEndRef = useRef(null);
+
+  // Auto-scroll transcript
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcript]);
+
+  // ── Start session ────────────────────────────────────────────────────
+  const startSession = useCallback(async () => {
+    try {
+      setStatus("connecting");
+      setTranscript([]);
+      historyRef.current = [];
+
+      /* 1. Fetch speech token + avatar config from backend */
+      const tokenRes = await fetch(`${API_BASE}/api/speech-token`);
+      if (!tokenRes.ok) throw new Error("Failed to fetch speech token");
+      const cfg = await tokenRes.json();
+
+      /* 2. SpeechConfig */
+      const speechCfg = SpeechSDK.SpeechConfig.fromAuthorizationToken(
+        cfg.token,
+        cfg.region
+      );
+      speechCfg.speechRecognitionLanguage = LANGUAGE_MAP[language] || "en-US";
+      speechCfg.speechSynthesisVoiceName = cfg.voiceName;
+
+      /* 3. AvatarConfig */
+      const videoFmt = new SpeechSDK.AvatarVideoFormat();
+      const avatarCfg = new SpeechSDK.AvatarConfig(
+        cfg.avatarCharacter,
+        cfg.avatarStyle,
+        videoFmt
+      );
+      avatarCfg.backgroundColor = "#0d1117"; // matches container bg
+
+      /* 4. AvatarSynthesizer */
+      const synth = new SpeechSDK.AvatarSynthesizer(speechCfg, avatarCfg);
+      avatarSynthRef.current = synth;
+
+      /* 5. WebRTC PeerConnection */
+      const ice = cfg.iceServers;
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: Array.isArray(ice.Urls) ? ice.Urls : [ice.Urls],
+            username: ice.Username,
+            credential: ice.Password,
+          },
+        ],
+      });
+      pcRef.current = pc;
+
+      pc.addTransceiver("video", { direction: "sendrecv" });
+      pc.addTransceiver("audio", { direction: "sendrecv" });
+
+      pc.ontrack = (evt) => {
+        if (videoRef.current && evt.streams[0]) {
+          videoRef.current.srcObject = evt.streams[0];
+          videoRef.current.play().catch(() => {});
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const s = pc.iceConnectionState;
+        if (s === "disconnected" || s === "failed") setStatus("error");
+      };
+
+      /* 6. Start avatar (WebRTC negotiation happens inside) */
+      const startRes = await synth.startAvatarAsync(pc);
+      if (startRes.reason === SpeechSDK.ResultReason.Canceled) {
+        throw new Error(startRes.errorDetails || "Avatar start canceled");
+      }
+
+      /* 7. Speech recognizer (browser mic) */
+      const audioCfg = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      const recog = new SpeechSDK.SpeechRecognizer(speechCfg, audioCfg);
+      recognizerRef.current = recog;
+
+      // Partial results + barge-in
+      recog.recognizing = (_, e) => {
+        setInterimText(e.result.text);
+        if (speakingRef.current) {
+          synth.stopSpeakingAsync().catch(() => {});
+          speakingRef.current = false;
+          setAiSpeaking(false);
+        }
+      };
+
+      // Final recognition
+      recog.recognized = async (_, e) => {
+        setInterimText("");
+        if (e.result.reason !== SpeechSDK.ResultReason.RecognizedSpeech) return;
+        const userText = e.result.text?.trim();
+        if (!userText) return;
+        if (processingRef.current) return;
+        processingRef.current = true;
+
+        // Add user message
+        const userMsg = { role: "user", text: userText };
+        historyRef.current.push(userMsg);
+        setTranscript((prev) => [...prev, userMsg]);
+
+        try {
+          // Stream AI response via SSE
+          const chatRes = await fetch(`${API_BASE}/api/chat-stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              user_message: userText,
+              conversation_history: historyRef.current.slice(0, -1),
+              system_prompt: systemPrompt,
+            }),
+          });
+
+          const reader = chatRes.body.getReader();
+          const decoder = new TextDecoder();
+          let fullText = "";
+          let buffer = "";
+          let sentenceQueue = [];
+          let avatarBusy = false;
+
+          // Speak sentences sequentially as they arrive
+          const speakNext = async () => {
+            if (avatarBusy || sentenceQueue.length === 0) return;
+            avatarBusy = true;
+            speakingRef.current = true;
+            setAiSpeaking(true);
+            while (sentenceQueue.length > 0) {
+              const sentence = sentenceQueue.shift();
+              try {
+                await synth.speakTextAsync(sentence);
+              } catch {}
+            }
+            avatarBusy = false;
+            speakingRef.current = false;
+            setAiSpeaking(false);
+          };
+
+          // Read SSE stream
+          let done = false;
+          while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            if (readerDone) break;
+            const text = decoder.decode(value, { stream: true });
+            const lines = text.split("\n");
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const payload = line.slice(6).trim();
+              if (payload === "[DONE]") { done = true; break; }
+              try {
+                const { token } = JSON.parse(payload);
+                if (!token) continue;
+                fullText += token;
+                buffer += token;
+                // Split on sentence boundaries
+                const sentenceMatch = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
+                if (sentenceMatch) {
+                  sentenceQueue.push(sentenceMatch[1].trim());
+                  buffer = sentenceMatch[2];
+                  speakNext(); // fire-and-forget, queued internally
+                }
+              } catch {}
+            }
+          }
+
+          // Flush remaining buffer
+          if (buffer.trim()) {
+            sentenceQueue.push(buffer.trim());
+          }
+          await speakNext();
+
+          // Wait for avatar to finish all queued sentences
+          while (avatarBusy) {
+            await new Promise((r) => setTimeout(r, 50));
+          }
+
+          // Add AI message to history
+          const aiMsg = { role: "assistant", text: fullText };
+          historyRef.current.push(aiMsg);
+          setTranscript((prev) => [...prev, aiMsg]);
+
+          speakingRef.current = false;
+          setAiSpeaking(false);
+        } catch (err) {
+          console.error("Chat/speak error:", err);
+          speakingRef.current = false;
+          setAiSpeaking(false);
+        } finally {
+          processingRef.current = false;
+        }
+      };
+
+      recog.canceled = (_, e) =>
+        console.warn("Recognition canceled:", e.errorDetails);
+
+      /* 8. Start continuous recognition */
+      recog.startContinuousRecognitionAsync(
+        () => setStatus("connected"),
+        (err) => {
+          console.error("Recognition start error:", err);
+          setStatus("error");
+        }
+      );
+    } catch (err) {
+      console.error("Session start error:", err);
+      setStatus("error");
+    }
+  }, [language, systemPrompt]);
+
+  // ── End session ──────────────────────────────────────────────────────
+  const endSession = useCallback(async () => {
+    setStatus("idle");
+
+    // Stop recognition
+    if (recognizerRef.current) {
+      try {
+        recognizerRef.current.stopContinuousRecognitionAsync();
+      } catch {}
+      recognizerRef.current.close();
+      recognizerRef.current = null;
+    }
+
+    // Stop avatar
+    if (avatarSynthRef.current) {
+      try {
+        await avatarSynthRef.current.stopAvatarAsync();
+      } catch {}
+      avatarSynthRef.current.close();
+      avatarSynthRef.current = null;
+    }
+
+    // Close WebRTC
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+
+    // Clear video
+    if (videoRef.current) videoRef.current.srcObject = null;
+
+    const history = historyRef.current;
+
+    // Send transcript for evaluation
+    try {
+      const res = await fetch(`${API_BASE}/api/evaluate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript: history }),
+      });
+      const data = await res.json();
+      navigate("/customer-session-report", {
+        state: {
+          strength: data.strength || [],
+          weakness: data.weakness || [],
+          rating: data.rating ?? 0,
+          summary: data.summary || "",
+          transcript: history,
+          language,
+          systemPrompt,
+        },
+      });
+    } catch {
+      navigate("/customer-session-report", {
+        state: {
+          strength: [],
+          weakness: [],
+          rating: 0,
+          summary: "Could not reach the backend for evaluation.",
+          transcript: history,
+          language,
+          systemPrompt,
+        },
+      });
+    }
+  }, [language, systemPrompt, navigate]);
+
+  // ── Mute toggle ──────────────────────────────────────────────────────
+  const toggleMute = useCallback(() => {
+    const recog = recognizerRef.current;
+    const synth = avatarSynthRef.current;
+    if (!recog) return;
+    if (isMuted) {
+      // Unmute: resume recognition
+      recog.startContinuousRecognitionAsync();
+    } else {
+      // Mute: stop recognition + stop avatar speaking
+      recog.stopContinuousRecognitionAsync();
+      if (synth && speakingRef.current) {
+        synth.stopSpeakingAsync().catch(() => {});
+        speakingRef.current = false;
+        setAiSpeaking(false);
+      }
+    }
+    setIsMuted((m) => !m);
+  }, [isMuted]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      try { recognizerRef.current?.close(); } catch {}
+      try { avatarSynthRef.current?.close(); } catch {}
+      try { pcRef.current?.close(); } catch {}
+    };
+  }, []);
+
+  const isLive = status === "connected";
+
+  // ── Render ───────────────────────────────────────────────────────────
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center px-6 relative">
+      {/* Background orbs */}
+      <div className="fixed top-[-15%] left-[-10%] w-[400px] h-[400px] bg-indigo-600/15 rounded-full blur-[100px] pointer-events-none" />
+      <div className="fixed bottom-[-15%] right-[-10%] w-[400px] h-[400px] bg-cyan-500/10 rounded-full blur-[100px] pointer-events-none" />
+
+      {/* Back */}
+      <button
+        onClick={() => navigate("/dashboard")}
+        className="absolute top-6 left-6 flex items-center gap-2 text-sm text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2 rounded-xl transition-all duration-200"
+      >
+        <FiArrowLeft /> Back
+      </button>
+
+      <div className={`relative animate-fade-in w-full ${isLive || status === "connecting" ? "max-w-7xl" : "max-w-4xl"}`}>
+        <h1 className="text-2xl font-bold text-center mb-6 bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
+          Customer Meeting
+        </h1>
+
+        {/* ── Setup controls (hidden when live) ── */}
+        {!isLive && status !== "connecting" && (
+          <>
+            <div className="mb-4">
+              <label className="flex items-center gap-2 mb-2 text-sm font-medium text-slate-300">
+                <FiGlobe className="text-indigo-400" /> Select Language
+              </label>
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                className="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-slate-200 focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/25 transition-all appearance-none cursor-pointer"
+              >
+                {Object.keys(LANGUAGE_MAP).map((l) => (
+                  <option key={l} className="bg-slate-900">
+                    {l}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="mb-6">
+              <label className="flex items-center gap-2 mb-2 text-sm font-medium text-slate-300">
+                <FiEdit3 className="text-indigo-400" /> System Prompt
+              </label>
+              <textarea
+                placeholder="Example: Behave like a skeptical enterprise buyer evaluating CRM software..."
+                value={systemPrompt}
+                onChange={(e) => setSystemPrompt(e.target.value)}
+                className="w-full p-3 bg-white/5 border border-white/10 rounded-xl text-slate-200 placeholder-slate-600 h-24 resize-none focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/25 transition-all"
+              />
+            </div>
+          </>
+        )}
+
+        {/* ── Live session: side-by-side layout ── */}
+        {(isLive || status === "connecting") && (
+        <div className="flex gap-4 mb-4" style={{ height: 580 }}>
+          {/* Left: Transcript */}
+          <div className="w-[340px] flex-shrink-0 flex flex-col" style={{ height: 580 }}>
+            <h2 className="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wider">Live Transcript</h2>
+            <div className="flex-1 overflow-y-auto space-y-3 bg-white/5 border border-white/10 rounded-xl p-4">
+              {transcript.length === 0 && (
+                <p className="text-sm text-slate-600 italic">Conversation will appear here...</p>
+              )}
+              {transcript.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`text-sm ${
+                    msg.role === "user" ? "text-indigo-300" : "text-emerald-300"
+                  }`}
+                >
+                  <span className="font-semibold">
+                    {msg.role === "user" ? "You" : "AI Customer"}:
+                  </span>{" "}
+                  {msg.text}
+                </div>
+              ))}
+              {interimText && (
+                <div className="text-sm text-slate-500 italic">
+                  &ldquo;{interimText}&rdquo;
+                </div>
+              )}
+              <div ref={transcriptEndRef} />
+            </div>
+          </div>
+
+          {/* Right: Avatar */}
+          <div className="flex-1 flex flex-col">
+            <div
+              className={`relative rounded-2xl overflow-hidden border-2 transition-all duration-500 flex-1 ${
+                isLive
+                  ? "border-indigo-500/40 shadow-lg shadow-indigo-500/20"
+                  : "border-white/10"
+              }`}
+              style={{ background: "#0d1117" }}
+            >
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                className="w-full h-full object-cover"
+              />
+              {status === "connecting" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-500">
+                  <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3" />
+                  <span className="text-sm">Starting avatar...</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        )}
+
+        {/* ── Status indicator ── */}
+        <div className="text-center mb-4">
+          <span
+            className={`inline-flex items-center gap-2 text-xs font-medium px-3 py-1 rounded-full ${
+              isLive
+                ? aiSpeaking
+                  ? "bg-purple-500/10 text-purple-400"
+                  : "bg-emerald-500/10 text-emerald-400"
+                : status === "connecting"
+                ? "bg-amber-500/10 text-amber-400"
+                : status === "error"
+                ? "bg-red-500/10 text-red-400"
+                : "bg-white/5 text-slate-500"
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isLive
+                  ? aiSpeaking
+                    ? "bg-purple-400 animate-pulse"
+                    : "bg-emerald-400 animate-pulse"
+                  : status === "connecting"
+                  ? "bg-amber-400 animate-pulse"
+                  : status === "error"
+                  ? "bg-red-400"
+                  : "bg-slate-600"
+              }`}
+            />
+            {isLive
+              ? aiSpeaking
+                ? "AI Customer speaking..."
+                : "Live — speak now"
+              : status === "connecting"
+              ? "Starting avatar session..."
+              : status === "error"
+              ? "Connection failed — try again"
+              : "Ready to start"}
+          </span>
+        </div>
+
+        {/* ── Action buttons ── */}
+        <div className="flex justify-center gap-3">
+          {!isLive ? (
+            <button
+              onClick={startSession}
+              disabled={status === "connecting"}
+              className="group flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 px-8 py-3.5 rounded-xl text-white font-medium transition-all duration-300 shadow-lg shadow-indigo-500/20 hover:shadow-indigo-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <FiMic className="transition-transform group-hover:scale-110" />
+              {status === "connecting" ? "Starting..." : "Start Session"}
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={toggleMute}
+                className={`flex items-center gap-2 px-5 py-3.5 rounded-xl font-medium transition-all duration-300 border ${
+                  isMuted
+                    ? "bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20"
+                    : "bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                {isMuted ? <FiMicOff /> : <FiMic />}
+                {isMuted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                onClick={endSession}
+                className="group flex items-center gap-2 bg-gradient-to-r from-red-600 to-rose-500 hover:from-red-500 hover:to-rose-400 px-8 py-3.5 rounded-xl text-white font-medium transition-all duration-300 shadow-lg shadow-red-500/20 hover:shadow-red-500/30"
+              >
+                <FiPhoneOff className="transition-transform group-hover:rotate-12" />
+                End Session
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
