@@ -1,53 +1,231 @@
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
-  TCP    127.0.0.1:8000         0.0.0.0:0              LISTENING       30084
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> taskkill /PID 30084 /F
-SUCCESS: The process with PID 30084 has been terminated.
-[1] wait-on http://localhost:3000 && electron . exited with code 1
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> $env:CSC_IDENTITY_AUTO_DISCOVERY="false"
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run build:installer     
+const { app, BrowserWindow, session, dialog, protocol, net } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const { spawn } = require("child_process");
+const http = require("http");
+const { pathToFileURL } = require("url");
 
-> vma-frontend@0.1.0 build:installer
-> vite build && electron-builder --win
+const IS_DEV = !app.isPackaged;
 
-vite v6.4.1 building for production...
-✓ 1218 modules transformed.
-build/index.html                     0.48 kB │ gzip:   0.31 kB
-build/assets/index-B6GzAJa1.css     25.83 kB │ gzip:   5.28 kB
-build/assets/index-D-sEF3a1.js   1,358.82 kB │ gzip: 360.18 kB
+// ── Configuration ───────────────────────────────────────────────────
+const BACKEND_PORT = 8000;
+const BACKEND_URL = `http://localhost:${BACKEND_PORT}`;
+const REACT_DEV_URL = "http://localhost:3000";
+const READY_POLL_INTERVAL_MS = 500;
+const READY_TIMEOUT_MS = 30000; // 30 seconds max wait
 
-(!) Some chunks are larger than 500 kB after minification. Consider:
-- Using dynamic import() to code-split the application
-- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
-- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
-✓ built in 8.08s
-  • electron-builder  version=26.8.1 os=10.0.26100
-  • loaded configuration  file=package.json ("build" field)
-  • description is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
-  • author is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
-  • writing effective config  file=dist\builder-effective-config.yaml
-  • executing @electron/rebuild  electronVersion=41.0.3 arch=x64 buildFromSource=false workspaceRoot=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend projectDir=./ appDir=./
-  • installing native dependencies  arch=x64
-  • completed installing native dependencies
-  • packaging       platform=win32 arch=x64 electron=41.0.3 appOutDir=dist\win-unpacked
-  ⨯ remove C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\dist\win-unpacked\resources\app.asar: The process cannot access the file because it is being used by another process.
-github.com/develar/go-fs-util.EnsureEmptyDir
-        /Users/runner/go/pkg/mod/github.com/develar/go-fs-util@v0.0.0-20190620175131-69a2d4542206/fs.go:98   
-github.com/develar/app-builder/pkg/electron.UnpackElectron.func1.1
-        /Users/runner/work/app-builder/app-builder/pkg/electron/electronUnpack.go:38
-github.com/develar/app-builder/pkg/util.MapAsyncConcurrency.func2
-        /Users/runner/work/app-builder/app-builder/pkg/util/async.go:68
-runtime.goexit
-        /Users/runner/hostedtoolcache/go/1.21.13/arm64/src/runtime/asm_amd64.s:1650
-  ⨯ C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\node_modules\app-builder-bin\win\x64\app-builder.exe process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE
-Exit code:
-1  failedTask=build stackTrace=Error: C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\node_modules\app-builder-bin\win\x64\app-builder.exe process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE
-Exit code:
-1
-    at ChildProcess.<anonymous> (C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\node_modules\builder-util\src\util.ts:272:14)
-    at Object.onceWrapper (node:events:623:26)
-    at ChildProcess.emit (node:events:508:28)
-    at ChildProcess.cp.emit (C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\node_modules\cross-spawn\lib\enoent.js:34:29)
-    at maybeClose (node:internal/child_process:1100:16)
-    at Process.ChildProcess._handle.onexit (node:internal/child_process:305:5)
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> 
+// ── Paths: dev vs production ────────────────────────────────────────
+const BACKEND_RESOURCE_DIR = IS_DEV
+  ? path.resolve(__dirname, "..", "..", "backend", "dist")
+  : path.join(process.resourcesPath, "backend");
+
+const BACKEND_EXE = path.join(BACKEND_RESOURCE_DIR, "run_backend.exe");
+const REACT_BUILD_DIR = path.join(__dirname, "..", "build");
+
+// ── Register custom protocol for production (must be before app ready) ──
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "app",
+    privileges: {
+      secure: true,
+      standard: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+    },
+  },
+]);
+
+let backendProcess = null;
+
+// ── Logging helper ──────────────────────────────────────────────────
+function log(msg) {
+  console.log(`[electron] ${msg}`);
+}
+
+// ── Start FastAPI backend ───────────────────────────────────────────
+function startBackend() {
+  return new Promise((resolve, reject) => {
+    // Check that the exe exists before trying to spawn it
+    if (!fs.existsSync(BACKEND_EXE)) {
+      return reject(
+        new Error(`Backend executable not found at:\n${BACKEND_EXE}\n\nRun PyInstaller first.`)
+      );
+    }
+
+    log(`Starting backend: ${BACKEND_EXE}`);
+    log(`Working directory: ${BACKEND_RESOURCE_DIR}`);
+
+    backendProcess = spawn(BACKEND_EXE, [], {
+      cwd: BACKEND_RESOURCE_DIR, // so .env is found next to the exe
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    backendProcess.stdout.on("data", (data) => {
+      process.stdout.write(`[backend] ${data}`);
+    });
+
+    backendProcess.stderr.on("data", (data) => {
+      process.stderr.write(`[backend] ${data}`);
+    });
+
+    backendProcess.on("error", (err) => {
+      log(`Failed to start backend: ${err.message}`);
+      reject(err);
+    });
+
+    backendProcess.on("exit", (code, signal) => {
+      log(`Backend exited (code=${code}, signal=${signal})`);
+      backendProcess = null;
+    });
+
+    // Don't wait for exit — resolve immediately so we can poll for readiness
+    resolve();
+  });
+}
+
+// ── Poll until backend responds ─────────────────────────────────────
+function waitForBackend() {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    log(`Waiting for backend at ${BACKEND_URL} (timeout ${READY_TIMEOUT_MS / 1000}s)...`);
+
+    function poll() {
+      // If backend process died, stop waiting
+      if (!backendProcess) {
+        return reject(new Error("Backend process exited before becoming ready"));
+      }
+
+      if (Date.now() > deadline) {
+        return reject(new Error(`Backend did not become ready within ${READY_TIMEOUT_MS / 1000}s`));
+      }
+
+      const req = http.get(BACKEND_URL, (res) => {
+        log(`Backend is ready (HTTP ${res.statusCode})`);
+        resolve();
+      });
+
+      req.on("error", () => {
+        // Not ready yet — retry
+        setTimeout(poll, READY_POLL_INTERVAL_MS);
+      });
+
+      req.setTimeout(2000, () => {
+        req.destroy();
+        setTimeout(poll, READY_POLL_INTERVAL_MS);
+      });
+    }
+
+    poll();
+  });
+}
+
+// ── Kill backend process ────────────────────────────────────────────
+function killBackend() {
+  if (!backendProcess) return;
+
+  log("Stopping backend...");
+  try {
+    if (process.platform === "win32") {
+      // On Windows, spawn("kill") doesn't work — use taskkill to kill the tree
+      spawn("taskkill", ["/pid", String(backendProcess.pid), "/f", "/t"], {
+        windowsHide: true,
+      });
+    } else {
+      backendProcess.kill("SIGTERM");
+    }
+  } catch (err) {
+    log(`Error killing backend: ${err.message}`);
+  }
+  backendProcess = null;
+}
+
+// ── Create Electron window ──────────────────────────────────────────
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 800,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
+
+  if (IS_DEV) {
+    win.loadURL(REACT_DEV_URL);
+    win.webContents.openDevTools();
+  } else {
+    win.loadURL("app://./index.html");
+  }
+}
+
+// ── App lifecycle ───────────────────────────────────────────────────
+app.whenReady().then(async () => {
+  // ── Production: serve React build via custom protocol ────────────
+  if (!IS_DEV) {
+    protocol.handle("app", (request) => {
+      const { pathname } = new URL(request.url);
+      const filePath = path.join(
+        REACT_BUILD_DIR,
+        decodeURIComponent(pathname)
+      );
+
+      // Serve file if it exists, otherwise fallback to index.html (SPA routing)
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        return net.fetch(pathToFileURL(filePath).href);
+      }
+      return net.fetch(
+        pathToFileURL(path.join(REACT_BUILD_DIR, "index.html")).href
+      );
+    });
+  }
+
+  // ── Microphone permission handling ──────────────────────────────
+  session.defaultSession.setPermissionRequestHandler(
+    (_webContents, permission, callback) => {
+      const allowed = ["media", "mediaKeySystem", "geolocation"];
+      callback(allowed.includes(permission));
+    }
+  );
+
+  session.defaultSession.setPermissionCheckHandler(
+    (_webContents, permission) => {
+      const allowed = ["media", "mediaKeySystem"];
+      return allowed.includes(permission);
+    }
+  );
+
+  // ── Start backend, wait for it, then open window ────────────────
+  try {
+    await startBackend();
+    await waitForBackend();
+    log("Backend is up — opening window");
+    createWindow();
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    dialog.showErrorBox(
+      "Backend failed to start",
+      `Could not start the FastAPI backend.\n\n${err.message}\n\nExpected exe at:\n${BACKEND_EXE}`
+    );
+    app.quit();
+    return;
+  }
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
+
+// Kill backend on quit — covers all exit paths
+app.on("will-quit", () => {
+  killBackend();
+});
+
+// Safety net: also kill on process exit
+process.on("exit", () => {
+  killBackend();
+});
