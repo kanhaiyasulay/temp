@@ -1,45 +1,7 @@
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run desktop
-
-> vma-frontend@0.1.0 desktop
-> concurrently "vite" "wait-on http://localhost:3000 && electron ."
-
-[0] 
-[0]   VITE v6.4.1  ready in 502 ms
-[0] 
-[0]   ➜  Local:   http://localhost:3000/
-[0]   ➜  Network: use --host to expose
-[1] 
-[1] [electron] Starting backend: C:\Users\KANSUL\Desktop\Avatar\backend\dist\run_backend.exe
-[1] [electron] Working directory: C:\Users\KANSUL\Desktop\Avatar\backend
-[1] [electron] Waiting for backend at http://localhost:8000 (timeout 30s)...
-[1] [backend] INFO:     Started server process [30980]
-[1] INFO:     Waiting for application startup.
-[1] INFO:     Application startup complete.
-[1] [backend] INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-[1] [backend] INFO:     127.0.0.1:58660 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [electron] Backend is up — opening window
-[1] [backend] INFO:     127.0.0.1:51365 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:51370 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:62964 - "GET / HTTP/1.1" 404 Not Found
-[1] [backend] INFO:     127.0.0.1:59436 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:59440 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:59444 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:59446 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:55091 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:55094 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:55096 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:55101 - "GET / HTTP/1.1" 404 Not Found
-[1] [electron] Backend is ready (HTTP 404)
-[1] [backend] INFO:     127.0.0.1:58361 - "GET /api/speech-token HTTP/1.1" 500 Internal Server Error
-[1] [backend] INFO:     127.0.0.1:58361 - "GET /api/speech-token HTTP/1.1" 500 Internal Server Error
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\backend\dist> .\run_backend.exe
+INFO:     Started server process [1524]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000): [winerror 10048] only one usage of each socket address (protocol/network address/port) is normally permitted
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
