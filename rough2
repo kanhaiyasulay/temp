@@ -1,5 +1,11 @@
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
+  TCP    127.0.0.1:8000         0.0.0.0:0              LISTENING       30084
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> taskkill /PID 30084 /F
+SUCCESS: The process with PID 30084 has been terminated.
+[1] wait-on http://localhost:3000 && electron . exited with code 1
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
 (.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> $env:CSC_IDENTITY_AUTO_DISCOVERY="false"
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run build:installer
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run build:installer     
 
 > vma-frontend@0.1.0 build:installer
 > vite build && electron-builder --win
@@ -14,13 +20,17 @@ build/assets/index-D-sEF3a1.js   1,358.82 kB │ gzip: 360.18 kB
 - Using dynamic import() to code-split the application
 - Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
 - Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
-✓ built in 8.06s
+✓ built in 8.08s
   • electron-builder  version=26.8.1 os=10.0.26100
   • loaded configuration  file=package.json ("build" field)
   • description is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
   • author is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
   • writing effective config  file=dist\builder-effective-config.yaml
-he file because it is being used by another process.
+  • executing @electron/rebuild  electronVersion=41.0.3 arch=x64 buildFromSource=false workspaceRoot=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend projectDir=./ appDir=./
+  • installing native dependencies  arch=x64
+  • completed installing native dependencies
+  • packaging       platform=win32 arch=x64 electron=41.0.3 appOutDir=dist\win-unpacked
+  ⨯ remove C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\dist\win-unpacked\resources\app.asar: The process cannot access the file because it is being used by another process.
 github.com/develar/go-fs-util.EnsureEmptyDir
         /Users/runner/go/pkg/mod/github.com/develar/go-fs-util@v0.0.0-20190620175131-69a2d4542206/fs.go:98   
 github.com/develar/app-builder/pkg/electron.UnpackElectron.func1.1
@@ -40,3 +50,4 @@ Exit code:
     at ChildProcess.cp.emit (C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\node_modules\cross-spawn\lib\enoent.js:34:29)
     at maybeClose (node:internal/child_process:1100:16)
     at Process.ChildProcess._handle.onexit (node:internal/child_process:305:5)
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> 
