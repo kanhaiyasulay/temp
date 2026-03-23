@@ -1,77 +1,16 @@
-I already have a working Electron + React setup for my voice agent project.
+Commands
+Development (unchanged)
+cd VMA-frontend
+npm run desktop
 
-Current setup:
+Build the installer
+cd VMA-frontend
+$env:CSC_IDENTITY_AUTO_DISCOVERY="false"
+npm run build:installer
+Output: VMA-frontend/dist/Voice Mode Agent Setup 0.1.0.exe (~133 MB)
 
-* Electron opens my React app (localhost:3000)
-* React frontend is working correctly inside Electron
-* FastAPI backend runs separately on localhost:8000 (manually started)
-
-Goal:
-I want Electron to automatically start my FastAPI backend when the app launches, and stop it when the app closes.
-
-IMPORTANT REQUIREMENTS:
-
-* Do NOT break my existing Electron setup
-* Do NOT modify my React code
-* Only update Electron main process (main.js or equivalent)
-* Backend should start using uvicorn
-* Ensure Electron waits until backend is fully ready before loading the React app
-* Add proper logging so I can see backend logs in terminal
-* Ensure backend process is killed when Electron app closes
-
-Technical requirements:
-
-1. Start backend using child_process.spawn
-   Example:
-
-   * uvicorn main --port 8000
-   * Adjust module path if needed
-
-2. Wait for backend readiness before opening window
-
-   * Use a reliable method (like wait-on or polling)
-   * Wait for http://localhost:8000 to respond
-
-3. Only after backend is ready:
-
-   * Load React app (http://localhost:3000)
-
-4. Add proper error handling:
-
-   * Log backend stdout and stderr
-   * Handle backend start failure
-
-5. Clean shutdown:
-
-   * Kill backend process when Electron quits
-
-6. Keep implementation SIMPLE and robust
-
-   * No over-engineering
-   * No TypeScript conversion
-   * No restructuring of project
-
-7. Provide:
-
-   * Updated main.js (full code)
-   * Any required npm installs (like wait-on)
-   * Exact commands to run
-
-8. Edge cases to handle:
-
-   * Backend takes time to start
-   * Port already in use
-   * Backend crashes
-
-Do NOT:
-
-* Bundle backend into exe yet
-* Change frontend/backend ports
-* Modify existing business logic
-
-Output format:
-
-* Full updated code
-* Commands to run
-
-Assume I will directly copy and run your code, so correctness is critical.
+What end users do
+Run Voice Mode Agent Setup 0.1.0.exe
+Choose install location → Install
+Launch "Voice Mode Agent" from Start Menu or Desktop
+App auto-starts the backend, waits for it, then shows the UI — no Python or Node needed
