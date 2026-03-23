@@ -1,8 +1,90 @@
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar> cd backend/dist
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\backend\dist> .\run_backend.exe
-INFO:     Started server process [6984]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-ERROR:    [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000): [winerror 10048] only one usage of each socket address (protocol/network address/port) is normally permitted
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.
+I have a working Electron + React + FastAPI desktop app.
+
+Current setup:
+
+* Electron launches React frontend (Vite on localhost:3000 in dev)
+* Backend is packaged as run_backend.exe using PyInstaller
+* Electron starts the backend automatically using spawn()
+* .env file is placed inside backend/dist and works correctly
+* The app works perfectly when running `npm run desktop`
+
+Goal:
+I want to package this into a production-ready Windows installer (.exe) using electron-builder so that other users can install and run the app without needing Node.js or Python.
+
+IMPORTANT REQUIREMENTS:
+
+* Do NOT break my current working setup
+* Do NOT modify my React or backend logic
+* Only add packaging support
+* Ensure backend.exe and .env are bundled correctly inside the installer
+* Ensure Electron can correctly locate and run backend.exe in both:
+
+  * Development mode
+  * Production (installed app)
+
+Your tasks:
+
+1. Install and configure electron-builder
+
+* Add correct dev dependency
+* Add build configuration inside package.json
+
+2. Configure packaging
+
+* Ensure React build output is included
+* Ensure electron main process files are included
+* Include backend/dist folder (run_backend.exe + .env) using extraResources
+
+3. Update Electron main process (main.cjs or main.js)
+
+* Modify backend path logic to support both dev and production
+* Use something like:
+
+  * __dirname for dev
+  * process.resourcesPath for production
+* Ensure spawn() uses correct path
+* Ensure cwd is set so .env loads properly
+
+4. Handle environment differences
+
+* Dev: use localhost React server
+* Prod: load built React files (file:// path)
+
+5. Add scripts in package.json
+
+* build React app
+* run electron-builder
+
+6. Ensure output
+
+* Generates Windows installer (.exe)
+* Uses NSIS target
+
+7. Provide:
+
+* Updated package.json (only relevant sections)
+* Updated main.cjs (only modified parts)
+* Commands to:
+
+  * build React
+  * build installer
+
+8. Keep it simple and robust
+
+* No over-engineering
+* No TypeScript migration
+* No unnecessary tools
+
+9. Do NOT:
+
+* Change ports
+* Modify backend code
+* Remove existing working logic
+
+Output format:
+
+* Step-by-step instructions
+* Full code snippets for changes
+* Commands to run
+
+Assume I will directly copy and run your code, so correctness is critical.
