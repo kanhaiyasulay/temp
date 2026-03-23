@@ -1,42 +1,29 @@
-What was changed
-1. Created run_backend.py — PyInstaller entry point
-Resolves .env from the exe's directory (not PyInstaller's temp _MEIPASS folder)
-Sets cwd to the exe's directory so logs/ and .env are found
-Starts uvicorn programmatically on port 8000
-2. Updated main.py:13-21 — frozen-exe compatibility
-Minimal change: added sys.frozen detection so BACKEND_DIR and .env loading use the exe's directory instead of _MEIPASS when running as an exe. Zero behavior change when running normally with Python.
-
-3. Built run_backend.exe (~22 MB)
-PyInstaller --onefile build with all FastAPI/uvicorn dependencies bundled.
-
-4. Updated electron/main.cjs — spawn exe instead of Python
-Replaced PYTHON_EXE + ["-m", "uvicorn", ...] with BACKEND_EXE (run_backend.exe)
-Added pre-check: if exe doesn't exist, shows clear error dialog
-All other behavior unchanged (polling, kill on quit, mic permissions, etc.)
-
-
-Commands
-Rebuild the exe (after backend code changes)
-cd backend
-.\.venv\Scripts\pyinstaller.exe --onefile --name run_backend ^
-  --hidden-import=main ^
-  --hidden-import=uvicorn.logging --hidden-import=uvicorn.loops ^
-  --hidden-import=uvicorn.loops.auto --hidden-import=uvicorn.protocols ^
-  --hidden-import=uvicorn.protocols.http --hidden-import=uvicorn.protocols.http.auto ^
-  --hidden-import=uvicorn.protocols.websockets --hidden-import=uvicorn.protocols.websockets.auto ^
-  --hidden-import=uvicorn.lifespan --hidden-import=uvicorn.lifespan.on ^
-  --hidden-import=uvicorn.lifespan.off --hidden-import=truststore ^
-  --hidden-import=httpx --hidden-import=dotenv ^
-  --add-data "main.py;." run_backend.py
-
-Test the exe manually
-cd backend
-dist\run_backend.exe
-# Then open http://localhost:8000/docs in browser — you should see the FastAPI Swagger UI
-
-Run the full desktop app
-cd VMA-frontend
-npm run desktop
-This starts Vite (port 3000) → Electron launches → spawns run_backend.exe (port 8000) → polls until ready → opens window. When you close the app, the backend exe is killed automatically.
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar\backend\dist> .\run_backend.exe
+INFO:     Started server process [26108]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+WARNING:  Invalid HTTP request received.
+WARNING:  Invalid HTTP request received.
+Exception in callback _ProactorBasePipeTransport._call_connection_lost()
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost()>
+Traceback (most recent call last):
+  File "asyncio\events.py", line 94, in _run
+  File "asyncio\proactor_events.py", line 165, in _call_connection_lost
+ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host    
+WARNING:  Invalid HTTP request received.
+WARNING:  Invalid HTTP request received.
+WARNING:  Invalid HTTP request received.
+WARNING:  Invalid HTTP request received.
+Exception in callback _ProactorBasePipeTransport._call_connection_lost()
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost()>
+Traceback (most recent call last):
+  File "asyncio\events.py", line 94, in _run
+  File "asyncio\proactor_events.py", line 165, in _call_connection_lost
+ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host    
+INFO:     127.0.0.1:51997 - "GET / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:51997 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:64785 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64785 - "GET /openapi.json HTTP/1.1" 200 OK
 
 
