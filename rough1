@@ -1,84 +1,42 @@
-I have an existing project with the following setup:
+What was changed
+1. Created run_backend.py — PyInstaller entry point
+Resolves .env from the exe's directory (not PyInstaller's temp _MEIPASS folder)
+Sets cwd to the exe's directory so logs/ and .env are found
+Starts uvicorn programmatically on port 8000
+2. Updated main.py:13-21 — frozen-exe compatibility
+Minimal change: added sys.frozen detection so BACKEND_DIR and .env loading use the exe's directory instead of _MEIPASS when running as an exe. Zero behavior change when running normally with Python.
 
-Frontend:
+3. Built run_backend.exe (~22 MB)
+PyInstaller --onefile build with all FastAPI/uvicorn dependencies bundled.
 
-* React app (created using Create React App or Vite)
-* Runs on http://localhost:3000
-* Uses microphone (WebRTC / MediaDevices API) for voice input
-* Contains a voice agent UI (avatar + audio streaming)
+4. Updated electron/main.cjs — spawn exe instead of Python
+Replaced PYTHON_EXE + ["-m", "uvicorn", ...] with BACKEND_EXE (run_backend.exe)
+Added pre-check: if exe doesn't exist, shows clear error dialog
+All other behavior unchanged (polling, kill on quit, mic permissions, etc.)
 
-Backend:
 
-* FastAPI server running separately on http://localhost:8000
-* Handles AI + voice processing
+Commands
+Rebuild the exe (after backend code changes)
+cd backend
+.\.venv\Scripts\pyinstaller.exe --onefile --name run_backend ^
+  --hidden-import=main ^
+  --hidden-import=uvicorn.logging --hidden-import=uvicorn.loops ^
+  --hidden-import=uvicorn.loops.auto --hidden-import=uvicorn.protocols ^
+  --hidden-import=uvicorn.protocols.http --hidden-import=uvicorn.protocols.http.auto ^
+  --hidden-import=uvicorn.protocols.websockets --hidden-import=uvicorn.protocols.websockets.auto ^
+  --hidden-import=uvicorn.lifespan --hidden-import=uvicorn.lifespan.on ^
+  --hidden-import=uvicorn.lifespan.off --hidden-import=truststore ^
+  --hidden-import=httpx --hidden-import=dotenv ^
+  --add-data "main.py;." run_backend.py
 
-Goal:
-I want to convert this into a desktop application using Electron, WITHOUT breaking my existing functionality.
+Test the exe manually
+cd backend
+dist\run_backend.exe
+# Then open http://localhost:8000/docs in browser — you should see the FastAPI Swagger UI
 
-IMPORTANT REQUIREMENTS:
+Run the full desktop app
+cd VMA-frontend
+npm run desktop
+This starts Vite (port 3000) → Electron launches → spawns run_backend.exe (port 8000) → polls until ready → opens window. When you close the app, the backend exe is killed automatically.
 
-* Do NOT modify my existing React components or business logic
-* Only add Electron setup around it
-* Keep FastAPI running separately (do NOT bundle backend yet)
-* Ensure microphone access works inside Electron
-* The app must open a desktop window that loads my React app
 
-Your tasks:
-
-1. Project Setup
-
-* Explain where to install Electron (root or frontend folder)
-* Install required dependencies (electron, concurrently, etc.)
-
-2. File Creation
-
-* Create a complete `main.js` file for Electron
-* Configure BrowserWindow properly
-* Load React app via http://localhost:3000
-* Enable microphone permissions
-
-3. package.json Changes
-
-* Add "main": "main.js"
-* Add scripts:
-
-  * "electron"
-  * "desktop" (to run React + Electron together)
-* Use concurrently to run both
-
-4. Microphone + Permissions
-
-* Ensure Electron allows microphone access
-* Add any required flags or settings
-
-5. Running Instructions
-
-* Exact commands to start:
-
-  * React
-  * Electron
-  * Both together
-
-6. Folder Structure
-
-* Show final project structure after changes
-
-7. Common Issues + Fixes
-
-* Mic not working
-* React not loading
-* Port issues
-
-8. Keep it SIMPLE and WORKING
-
-* Do not over-engineer
-* Do not introduce TypeScript if not needed
-* Do not convert to production build yet
-
-Output format:
-
-* Step-by-step instructions
-* Full code blocks (main.js, package.json)
-* Clear commands to run
-
-Assume I am a developer but new to Electron, so clarity is important.
