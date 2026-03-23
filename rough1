@@ -1,5 +1,6 @@
+(.venv) PS C:\Users\KANSUL\Desktop\Avatar> cd backend/dist
 (.venv) PS C:\Users\KANSUL\Desktop\Avatar\backend\dist> .\run_backend.exe
-INFO:     Started server process [1524]
+INFO:     Started server process [6984]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 ERROR:    [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000): [winerror 10048] only one usage of each socket address (protocol/network address/port) is normally permitted
