@@ -1,13 +1,23 @@
-PS C:\Users\KANSUL\Desktop\Avatar> git checkout -b working-final-electron
-Switched to a new branch 'working-final-electron'
-PS C:\Users\KANSUL\Desktop\Avatar> git branch
-  master
-  no-avatar
-  working-avatar
-  working-electron
-* working-final-electron
-PS C:\Users\KANSUL\Desktop\Avatar> git add .
-warning: in the working copy of 'VMA-frontend/dist/builder-debug.yml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'VMA-frontend/dist/builder-effective-config.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'VMA-frontend/dist/win-unpacked/LICENSE.electron.txt', LF will be replaced by CRLF the next time Git touches it      
-PS C:\Users\KANSUL\Desktop\Avatar>
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production
+/build
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
