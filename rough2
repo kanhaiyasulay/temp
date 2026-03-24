@@ -1,7 +1,89 @@
-PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000                                
-  TCP    127.0.0.1:8000         0.0.0.0:0              LISTENING       26860
-PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> taskkill /PID 26860 /F                                      
-SUCCESS: The process with PID 26860 has been terminated.
-PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
-PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> netstat -ano | findstr :8000
-PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> 
+I have a working Electron + React + FastAPI desktop app, but the production build is showing a blank screen.
+
+Currently, the Electron app is using a custom `app://` protocol with `protocol.registerSchemesAsPrivileged` and `protocol.handle` to load the React build. This setup is causing issues in the packaged app.
+
+I want to SIMPLIFY the architecture and REMOVE all unnecessary complexity.
+
+GOAL:
+Replace the custom protocol-based loading with a simple and reliable approach using `win.loadFile()` for production.
+
+IMPORTANT REQUIREMENTS:
+
+1. REMOVE all custom protocol logic:
+
+   * Remove `protocol.registerSchemesAsPrivileged`
+   * Remove `protocol.handle`
+   * Remove any use of `app://`
+   * Remove any use of `net.fetch` or `pathToFileURL`
+
+2. UPDATE window loading logic:
+
+   Use this pattern:
+
+   ```js
+   if (IS_DEV) {
+     win.loadURL("http://localhost:3000");
+   } else {
+     win.loadFile(path.join(__dirname, "..", "build", "index.html"));
+   }
+   ```
+
+3. KEEP everything else unchanged:
+
+   * Backend auto-start using run_backend.exe
+   * Backend polling (waitForBackend)
+   * Logging
+   * Kill backend on app quit
+   * Permissions (mic, etc.)
+   * DO NOT change ports or backend logic
+
+4. ENSURE React build works:
+
+   * Confirm that `vite.config.js` has:
+
+     ```js
+     base: "./"
+     ```
+   * Ensure `npm run build` outputs:
+
+     ```
+     build/index.html
+     build/assets/*
+     ```
+
+5. ELECTRON BUILDER CONFIG:
+   Make sure the React build folder is included in packaging:
+
+   In `package.json`:
+
+   ```json
+   "build": {
+     "files": [
+       "build/**/*",
+       "electron/**/*",
+       "node_modules/**/*"
+     ]
+   }
+   ```
+
+6. OUTPUT REQUIRED:
+
+   * Full updated `main.cjs`
+   * Any required changes in `vite.config.js`
+   * Any required changes in `package.json`
+   * Exact commands to rebuild:
+
+     * npm run build
+     * npm run build:installer
+
+7. DO NOT:
+
+   * Do NOT reintroduce custom protocols
+   * Do NOT use advanced Electron APIs unnecessarily
+   * Do NOT change project structure
+   * Do NOT modify frontend React code
+
+GOAL SUMMARY:
+Make the production app load React using `loadFile()` instead of custom protocols, so that the blank screen issue is fixed in the simplest and most stable way.
+
+Assume I will copy-paste your changes directly, so correctness is critical.
