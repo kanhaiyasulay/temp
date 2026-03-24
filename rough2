@@ -1,52 +1,19 @@
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run build
+I can see the issue. The packaged .exe loads the React build via a custom app:// protocol, and the problem is likely twofold:
 
-> vma-frontend@0.1.0 build
-> vite build
+Asset paths in the built HTML are absolute (/assets/...) instead of relative
+The protocol handler uses net.fetch(pathToFileURL(...)) which may not work with asar-packed files
+Let me fix both:
 
-vite v6.4.1 building for production...
-✓ 1218 modules transformed.
-build/index.html                     0.48 kB │ gzip:   0.31 kB
-build/assets/index-B6GzAJa1.css     25.83 kB │ gzip:   5.28 kB
-build/assets/index-D-sEF3a1.js   1,358.82 kB │ gzip: 360.18 kB
+Now rebuild the app:
 
-(!) Some chunks are larger than 500 kB after minification. Consider:
-- Using dynamic import() to code-split the application
-- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
-- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
-✓ built in 14.76s
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> npm run build:installer
+Completed: Rebuild the app (3/3)
 
-> vma-frontend@0.1.0 build:installer
-> vite build && electron-builder --win
+Build succeeded. The new installer is at VMA-frontend\dist\Voice Mode Agent Setup 0.1.0.exe.
 
-vite v6.4.1 building for production...
-✓ 1218 modules transformed.
-build/index.html                     0.48 kB │ gzip:   0.31 kB
-build/assets/index-B6GzAJa1.css     25.83 kB │ gzip:   5.28 kB
-build/assets/index-D-sEF3a1.js   1,358.82 kB │ gzip: 360.18 kB
+Two issues were causing the blank screen:
 
-(!) Some chunks are larger than 500 kB after minification. Consider:
-- Using dynamic import() to code-split the application
-- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
-- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
-✓ built in 14.43s
-  • electron-builder  version=26.8.1 os=10.0.26100
-  • loaded configuration  file=package.json ("build" field)
-  • description is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
-  • author is missed in the package.json  appPackageFile=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend\package.json
-  • writing effective config  file=dist\builder-effective-config.yaml
-  • executing @electron/rebuild  electronVersion=41.0.3 arch=x64 buildFromSource=false workspaceRoot=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend projectDir=./ appDir=./
-  • installing native dependencies  arch=x64
-  • completed installing native dependencies
-  • packaging       platform=win32 arch=x64 electron=41.0.3 appOutDir=dist\win-unpacked
-  • searching for node modules  pm=npm searchDir=C:\Users\KANSUL\Desktop\Avatar\VMA-frontend
-(node:10796) [DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
-(Use `node --trace-deprecation ...` to show where the warning was created)
-  • duplicate dependency references  dependencies=["react-dom@18.2.0","react@18.2.0","browserslist@4.28.1","postcss@8.5.8","@azure/abort-controller@2.1.2","debug@4.3.4","debug@4.3.4","debug@4.3.4","react@18.2.0","loose-envify@1.4.0","react@18.2.0","react-dom@18.2.0","react-dom@18.2.0","react@18.2.0","react@18.2.0","loose-envify@1.4.0","react-redux@9.2.0","react@18.2.0","react-dom@18.2.0","react@18.2.0","react@18.2.0","react@18.2.0","d3-array@3.2.4","d3-interpolate@3.0.1","d3-time@3.1.0","d3-time@3.1.0","d3-array@3.2.4"]
-  • updating asar integrity executable resource  executablePath=dist\win-unpacked\Voice Mode Agent.exe
-  • building        target=nsis file=dist\Voice Mode Agent Setup 0.1.0.exe archs=x64 oneClick=false perMachine=false
-  • default Electron icon is used  reason=application icon is not set
-  • signing with signtool.exe  path=dist\Voice Mode Agent Setup 0.1.0.__uninstaller.exe
-  • signing with signtool.exe  path=dist\Voice Mode Agent Setup 0.1.0.exe
-  • building block map  blockMapFile=dist\Voice Mode Agent Setup 0.1.0.exe.blockmap
-(.venv) PS C:\Users\KANSUL\Desktop\Avatar\VMA-frontend> 
+Absolute asset paths — Vite was building with base: "/", so the HTML referenced assets as /assets/.... Inside a custom app:// protocol in a packaged Electron app, these absolute paths didn't resolve correctly. Fixed by setting base: "./" in vite.config.js so paths become relative (./assets/...).
+
+net.fetch with asar paths — The protocol handler used net.fetch(pathToFileURL(...)) to serve files. pathToFileURL creates standard  URLs that don't understand Electron's asar archives, so the packed files couldn't be read. Fixed by replacing it with fs.readFileSync() in electron/main.cjs, which is asar-aware in Electron.
+
+Reinstall from the new .exe and the app should render correctly.
