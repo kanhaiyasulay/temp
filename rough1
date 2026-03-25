@@ -1,7 +1,4 @@
-Hey team 👋
-
-We’ve been actively working on these features. Initially, the plan was to deploy everything as a web application, but we’ve now shifted our approach to a standalone desktop app. Going forward, we’ll be gradually introducing all these features into the desktop version (except for the mute functionality, which has some underlying complexities we’re still working through).
-
-This release marks our first version 🚀
-
-I’ll be rolling out a second version soon, which will include additional features along with improved stability and performance. Stay tuned!
+Thanks for the update, Katarzyna!
+It’s working fine on my side, including the Countly integration, so this might be environment-specific.
+Could you please share the error logs or console output? That’ll help me identify what’s causing the issue on your machine.
+Meanwhile, v0.2 has a few improvements, so it should behave more reliably — let me know how it goes.
