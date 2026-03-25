@@ -1,90 +1,257 @@
-I have a working Electron + React + FastAPI desktop app.
+const { app, BrowserWindow, session, dialog } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const { spawn } = require("child_process");
+const http = require("http");
 
-Current setup:
+const IS_DEV = !app.isPackaged;
 
-* Electron launches React frontend (Vite on localhost:3000 in dev)
-* Backend is packaged as run_backend.exe using PyInstaller
-* Electron starts the backend automatically using spawn()
-* .env file is placed inside backend/dist and works correctly
-* The app works perfectly when running `npm run desktop`
+// ── Configuration ───────────────────────────────────────────────────
+const BACKEND_PORT = 8000;
+const BACKEND_URL = `http://localhost:${BACKEND_PORT}`;
+const REACT_DEV_URL = "http://localhost:3000";
+const READY_POLL_INTERVAL_MS = 500;
+const READY_TIMEOUT_MS = 30000; // 30 seconds max wait
 
-Goal:
-I want to package this into a production-ready Windows installer (.exe) using electron-builder so that other users can install and run the app without needing Node.js or Python.
+// ── Paths: dev vs production ────────────────────────────────────────
+const BACKEND_RESOURCE_DIR = IS_DEV
+  ? path.resolve(__dirname, "..", "..", "backend", "dist")
+  : path.join(process.resourcesPath, "backend");
 
-IMPORTANT REQUIREMENTS:
+const BACKEND_EXE = path.join(BACKEND_RESOURCE_DIR, "run_backend.exe");
 
-* Do NOT break my current working setup
-* Do NOT modify my React or backend logic
-* Only add packaging support
-* Ensure backend.exe and .env are bundled correctly inside the installer
-* Ensure Electron can correctly locate and run backend.exe in both:
+let backendProcess = null;
 
-  * Development mode
-  * Production (installed app)
+// ── Debug log file (persists even without a terminal) ───────────────
+const LOG_FILE = path.join(app.getPath("userData"), "electron-debug.log");
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  console.log(`[electron] ${msg}`);
+  try { fs.appendFileSync(LOG_FILE, line + "\n"); } catch {}
+}
 
-Your tasks:
+// Log key paths immediately
+log(`IS_DEV = ${IS_DEV}`);
+log(`app.isPackaged = ${app.isPackaged}`);
+log(`__dirname = ${__dirname}`);
+log(`process.resourcesPath = ${process.resourcesPath}`);
+log(`BACKEND_RESOURCE_DIR = ${BACKEND_RESOURCE_DIR}`);
+log(`BACKEND_EXE = ${BACKEND_EXE}`);
+log(`Log file = ${LOG_FILE}`);
 
-1. Install and configure electron-builder
+// ── Start FastAPI backend ───────────────────────────────────────────
+function startBackend() {
+  return new Promise((resolve, reject) => {
+    // Check that the exe exists before trying to spawn it
+    if (!fs.existsSync(BACKEND_EXE)) {
+      return reject(
+        new Error(`Backend executable not found at:\n${BACKEND_EXE}\n\nRun PyInstaller first.`)
+      );
+    }
 
-* Add correct dev dependency
-* Add build configuration inside package.json
+    log(`Starting backend: ${BACKEND_EXE}`);
+    log(`Working directory: ${BACKEND_RESOURCE_DIR}`);
 
-2. Configure packaging
+    backendProcess = spawn(BACKEND_EXE, [], {
+      cwd: BACKEND_RESOURCE_DIR, // so .env is found next to the exe
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
 
-* Ensure React build output is included
-* Ensure electron main process files are included
-* Include backend/dist folder (run_backend.exe + .env) using extraResources
+    backendProcess.stdout.on("data", (data) => {
+      process.stdout.write(`[backend] ${data}`);
+    });
 
-3. Update Electron main process (main.cjs or main.js)
+    backendProcess.stderr.on("data", (data) => {
+      process.stderr.write(`[backend] ${data}`);
+    });
 
-* Modify backend path logic to support both dev and production
-* Use something like:
+    backendProcess.on("error", (err) => {
+      log(`Failed to start backend: ${err.message}`);
+      reject(err);
+    });
 
-  * __dirname for dev
-  * process.resourcesPath for production
-* Ensure spawn() uses correct path
-* Ensure cwd is set so .env loads properly
+    backendProcess.on("exit", (code, signal) => {
+      log(`Backend exited (code=${code}, signal=${signal})`);
+      backendProcess = null;
+    });
 
-4. Handle environment differences
+    // Don't wait for exit — resolve immediately so we can poll for readiness
+    resolve();
+  });
+}
 
-* Dev: use localhost React server
-* Prod: load built React files (file:// path)
+// ── Poll until backend responds ─────────────────────────────────────
+function waitForBackend() {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    log(`Waiting for backend at ${BACKEND_URL} (timeout ${READY_TIMEOUT_MS / 1000}s)...`);
 
-5. Add scripts in package.json
+    function poll() {
+      // If backend process died, stop waiting
+      if (!backendProcess) {
+        return reject(new Error("Backend process exited before becoming ready"));
+      }
 
-* build React app
-* run electron-builder
+      if (Date.now() > deadline) {
+        return reject(new Error(`Backend did not become ready within ${READY_TIMEOUT_MS / 1000}s`));
+      }
 
-6. Ensure output
+      const req = http.get(BACKEND_URL, (res) => {
+        log(`Backend is ready (HTTP ${res.statusCode})`);
+        resolve();
+      });
 
-* Generates Windows installer (.exe)
-* Uses NSIS target
+      req.on("error", () => {
+        // Not ready yet — retry
+        setTimeout(poll, READY_POLL_INTERVAL_MS);
+      });
 
-7. Provide:
+      req.setTimeout(2000, () => {
+        req.destroy();
+        setTimeout(poll, READY_POLL_INTERVAL_MS);
+      });
+    }
 
-* Updated package.json (only relevant sections)
-* Updated main.cjs (only modified parts)
-* Commands to:
+    poll();
+  });
+}
 
-  * build React
-  * build installer
+// ── Kill backend process ────────────────────────────────────────────
+function killBackend() {
+  if (!backendProcess) return;
 
-8. Keep it simple and robust
+  log("Stopping backend...");
+  try {
+    if (process.platform === "win32") {
+      // On Windows, spawn("kill") doesn't work — use taskkill to kill the tree
+      spawn("taskkill", ["/pid", String(backendProcess.pid), "/f", "/t"], {
+        windowsHide: true,
+      });
+    } else {
+      backendProcess.kill("SIGTERM");
+    }
+  } catch (err) {
+    log(`Error killing backend: ${err.message}`);
+  }
+  backendProcess = null;
+}
 
-* No over-engineering
-* No TypeScript migration
-* No unnecessary tools
+// ── Create Electron window ──────────────────────────────────────────
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 800,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
 
-9. Do NOT:
+  // Always open DevTools for debugging the blank screen
+  win.webContents.openDevTools();
 
-* Change ports
-* Modify backend code
-* Remove existing working logic
+  // Log renderer console messages to our log file
+  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+    log(`[renderer] (level=${level}) ${message} (${sourceId}:${line})`);
+  });
 
-Output format:
+  // Log page load failures
+  win.webContents.on("did-fail-load", (_e, errorCode, errorDesc, validatedURL) => {
+    log(`[LOAD FAILED] code=${errorCode} desc="${errorDesc}" url=${validatedURL}`);
+    dialog.showErrorBox("Page Load Failed", `code=${errorCode}\n${errorDesc}\nURL: ${validatedURL}`);
+  });
 
-* Step-by-step instructions
-* Full code snippets for changes
-* Commands to run
+  // Log when page finishes loading
+  win.webContents.on("did-finish-load", () => {
+    log(`[did-finish-load] URL = ${win.webContents.getURL()}`);
+  });
 
-Assume I will directly copy and run your code, so correctness is critical.
+  if (IS_DEV) {
+    log("Loading DEV URL: " + REACT_DEV_URL);
+    win.loadURL(REACT_DEV_URL);
+  } else {
+    const indexPath = path.join(__dirname, "..", "build", "index.html");
+    log(`Loading PROD file: ${indexPath}`);
+    log(`File exists? ${fs.existsSync(indexPath)}`);
+
+    // List what's actually in the build directory
+    const buildDir = path.join(__dirname, "..", "build");
+    log(`Build dir: ${buildDir}`);
+    log(`Build dir exists? ${fs.existsSync(buildDir)}`);
+    if (fs.existsSync(buildDir)) {
+      try {
+        const files = fs.readdirSync(buildDir);
+        log(`Build dir contents: ${JSON.stringify(files)}`);
+        const assetsDir = path.join(buildDir, "assets");
+        if (fs.existsSync(assetsDir)) {
+          log(`Assets dir contents: ${JSON.stringify(fs.readdirSync(assetsDir))}`);
+        } else {
+          log("Assets dir does NOT exist!");
+        }
+      } catch (e) { log(`Error listing build dir: ${e.message}`); }
+    }
+
+    // Read and log a snippet of index.html to verify contents
+    if (fs.existsSync(indexPath)) {
+      try {
+        const html = fs.readFileSync(indexPath, "utf-8").slice(0, 500);
+        log(`index.html (first 500 chars):\n${html}`);
+      } catch (e) { log(`Error reading index.html: ${e.message}`); }
+    }
+
+    win.loadFile(indexPath);
+  }
+}
+
+// ── App lifecycle ───────────────────────────────────────────────────
+app.whenReady().then(async () => {
+  // ── Microphone permission handling ──────────────────────────────
+  session.defaultSession.setPermissionRequestHandler(
+    (_webContents, permission, callback) => {
+      const allowed = ["media", "mediaKeySystem", "geolocation"];
+      callback(allowed.includes(permission));
+    }
+  );
+
+  session.defaultSession.setPermissionCheckHandler(
+    (_webContents, permission) => {
+      const allowed = ["media", "mediaKeySystem"];
+      return allowed.includes(permission);
+    }
+  );
+
+  // ── Start backend, wait for it, then open window ────────────────
+  try {
+    await startBackend();
+    await waitForBackend();
+    log("Backend is up — opening window");
+    createWindow();
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    dialog.showErrorBox(
+      "Backend failed to start",
+      `Could not start the FastAPI backend.\n\n${err.message}\n\nExpected exe at:\n${BACKEND_EXE}`
+    );
+    app.quit();
+    return;
+  }
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
+
+// Kill backend on quit — covers all exit paths
+app.on("will-quit", () => {
+  killBackend();
+});
+
+// Safety net: also kill on process exit
+process.on("exit", () => {
+  killBackend();
+});
